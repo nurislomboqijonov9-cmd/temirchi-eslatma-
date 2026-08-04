@@ -75,15 +75,19 @@ def init_db():
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         chat_id INTEGER, ism TEXT, tel TEXT, sana TEXT, izoh TEXT,
         yuborildi INTEGER DEFAULT 0, created TEXT)""")
+    try:
+        con.execute("ALTER TABLE eslatmalar ADD COLUMN vaqt TEXT")  # HH:MM (ixtiyoriy)
+    except Exception:
+        pass
     con.commit()
     con.close()
 
 
-def eslatma_qosh(chat_id, ism, tel, sana, izoh):
+def eslatma_qosh(chat_id, ism, tel, sana, izoh, vaqt=None):
     con = _con()
     cur = con.execute(
-        "INSERT INTO eslatmalar(chat_id,ism,tel,sana,izoh,yuborildi,created) VALUES(?,?,?,?,?,0,?)",
-        (chat_id, ism, tel, str(sana)[:10], izoh, now_tk().isoformat()))
+        "INSERT INTO eslatmalar(chat_id,ism,tel,sana,izoh,vaqt,yuborildi,created) VALUES(?,?,?,?,?,?,0,?)",
+        (chat_id, ism, tel, str(sana)[:10], izoh, (vaqt or None), now_tk().isoformat()))
     con.commit()
     rid = cur.lastrowid
     con.close()
@@ -110,11 +114,25 @@ def eslatmalar_kutilayotgan(chat_id, limit=50):
 
 
 def eslatmalar_bugun_hammasi():
-    """Bugungi (yoki o'tib ketgan, hali yuborilmagan) barcha eslatmalar."""
+    """9:00 otchot uchun — VAQTI YO'Q eslatmalar (vaqtlilar aniq vaqtida boradi)."""
     con = _con()
     rows = con.execute(
-        "SELECT * FROM eslatmalar WHERE yuborildi=0 AND sana<=? ORDER BY chat_id, sana",
+        "SELECT * FROM eslatmalar WHERE yuborildi=0 AND (vaqt IS NULL OR vaqt='') AND sana<=? ORDER BY chat_id, sana",
         (str(today_tk()),)).fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
+def eslatmalar_vaqtli_due(bugun, hhmm):
+    """Aniq vaqti kelgan (yoki o'tib ketgan) vaqtli eslatmalar."""
+    con = _con()
+    try:
+        rows = con.execute(
+            "SELECT * FROM eslatmalar WHERE yuborildi=0 AND vaqt IS NOT NULL AND vaqt!='' "
+            "AND (sana < ? OR (sana = ? AND vaqt <= ?)) ORDER BY sana, vaqt",
+            (bugun, bugun, hhmm)).fetchall()
+    except Exception:
+        rows = []
     con.close()
     return [dict(r) for r in rows]
 
@@ -141,21 +159,27 @@ class Eslatma(BaseModel):
     ism: str | None = Field(default=None, description="Mijoz ismi")
     tel: str | None = Field(default=None, description="Telefon raqami (bo'lsa)")
     sana: str | None = Field(default=None, description="Eslatiladigan sana, ISO YYYY-MM-DD")
+    vaqt: str | None = Field(default=None, description="Aniq vaqt (soat) — HH:MM, agar aytilsa. Aytilmasa null")
     izoh: str | None = Field(default=None, description="Nima uchun eslatish: masalan 'lesa olmoqchi', 'lesa oborish kerak'")
 
 
 def _now_context():
-    return f"(Bugun: {today_tk().isoformat()} — sanani shunga qarab hisobla. Yil aytilmasa, eng yaqin kelasi shu sanani ol.)"
+    return (f"(Bugun: {today_tk().isoformat()}, hozir soat {now_tk().strftime('%H:%M')} — "
+            f"sana va vaqtni shunga qarab hisobla. Yil aytilmasa, eng yaqin kelasi shu sanani ol.)")
 
 
 def parse_text(matn):
     """Erkin matndan eslatma ma'lumotini ajratadi."""
     sys = (
         "Sen ijara biznesi uchun eslatma yordamchisisan. Foydalanuvchi erkin matn yozadi. "
-        "Undan quyidagilarni ajrat: ism, tel (telefon raqami), sana (ISO YYYY-MM-DD), izoh (nima qilish kerak). "
+        "Undan quyidagilarni ajrat: ism, tel (telefon raqami), sana (ISO YYYY-MM-DD), "
+        "vaqt (aniq soat HH:MM — agar aytilsa), izoh (nima qilish kerak). "
         "Masalan: 'Akmal 998901234567 8-avgust lesa olmoqchi' -> ism=Akmal, tel=998901234567, "
-        "sana=2026-08-08, izoh='lesa olmoqchi'. Topilmagan maydonni null qoldir. "
-        "Sanani bugungi kundan kelib chiqib hisobla."
+        "sana=2026-08-08, vaqt=null, izoh='lesa olmoqchi'. "
+        "'bugun 21:31 da Akmalga qo'ng'iroq' -> sana=bugun, vaqt=21:31. "
+        "'ertaga soat 9 da' -> vaqt=09:00. 'kechqurun 8 da' -> vaqt=20:00. "
+        "Soat aytilmasa vaqt=null qoldir. Topilmagan maydonni null qoldir. "
+        "Sana va vaqtni bugungi kun va hozirgi soatdan kelib chiqib hisobla."
     )
     resp = client().models.generate_content(
         model=MODEL,
@@ -192,10 +216,26 @@ def _dmy(s):
         return str(s)
 
 
+def _vaqt_norm(v):
+    """'21:31','9','21.31','9 30' -> 'HH:MM'; noto'g'ri bo'lsa ''."""
+    if not v:
+        return ""
+    import re as _re
+    m = _re.search(r"(\d{1,2})[:\.\s]?(\d{2})\b", v) or _re.search(r"\b(\d{1,2})\b", v)
+    if not m:
+        return ""
+    h = int(m.group(1))
+    mi = int(m.group(2)) if (m.lastindex and m.lastindex >= 2 and m.group(2)) else 0
+    if h > 23 or mi > 59:
+        return ""
+    return f"{h:02d}:{mi:02d}"
+
+
 def _kartochka(e):
+    v = (e.get("vaqt") or "").strip()
     return (f"👤 {e.get('ism') or '—'}\n"
             f"📞 {e.get('tel') or '—'}\n"
-            f"📅 {_dmy(e.get('sana'))}\n"
+            f"📅 {_dmy(e.get('sana'))}" + (f" ⏰ {v}" if v else "") + "\n"
             f"📝 {e.get('izoh') or '—'}")
 
 
@@ -207,9 +247,11 @@ async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Salom! Bu — eslatma boti.\n\n"
         "Shunchaki yozing yoki ayting:\n"
-        "«Akmal 998901234567 8-avgust lesa olmoqchi»\n\n"
-        "Men ism, telefon, sana va izohni ajrataman — tasdiqlasangiz saqlayman.\n"
-        f"Har kuni {REPORT_HOUR}:00 da o'sha kungi eslatmalar keladi.\n\n"
+        "«Akmal 998901234567 8-avgust lesa olmoqchi»\n"
+        "«bugun 21:31 da Akmalga qo'ng'iroq»\n\n"
+        "Men ism, telefon, sana, soat va izohni ajrataman — tasdiqlasangiz saqlayman.\n"
+        f"• Soat aytsangiz — aynan o'sha vaqtda eslataman.\n"
+        f"• Soat aytmasangiz — o'sha kuni {REPORT_HOUR}:00 da eslataman.\n\n"
         "/royxat — kutilayotgan eslatmalar\n"
         "/bugun — bugungi eslatmalar\n"
         "/ochir <id> — o'chirish")
@@ -224,7 +266,9 @@ async def royxat_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     lines = ["📋 Kutilayotgan eslatmalar:\n"]
     for e in es:
-        lines.append(f"#{e['id']} · 📅 {_dmy(e['sana'])} · {e['ism'] or '—'} — {e['izoh'] or ''}")
+        v = (e.get("vaqt") or "").strip()
+        vaqt = f" ⏰ {v}" if v else ""
+        lines.append(f"#{e['id']} · 📅 {_dmy(e['sana'])}{vaqt} · {e['ism'] or '—'} — {e['izoh'] or ''}")
     await update.message.reply_text("\n".join(lines))
 
 
@@ -296,7 +340,8 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await msg.reply_text(f"Sanani topolmadim. Masalan «8-avgust» deb qo'shing.\nEshitganim: «{matn}»")
         return
 
-    d = {"ism": ism, "tel": (e.tel or "").strip(), "sana": sana, "izoh": (e.izoh or "").strip()}
+    vaqt = _vaqt_norm((e.vaqt or "").strip())
+    d = {"ism": ism, "tel": (e.tel or "").strip(), "sana": sana, "vaqt": vaqt, "izoh": (e.izoh or "").strip()}
     ctx.user_data["pending"] = d
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Saqlash", callback_data="eok"),
@@ -317,10 +362,13 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not d:
             await q.edit_message_text("Ma'lumot topilmadi, qaytadan yozing.")
             return
-        rid = eslatma_qosh(q.message.chat_id, d["ism"], d["tel"], d["sana"], d["izoh"])
+        rid = eslatma_qosh(q.message.chat_id, d["ism"], d["tel"], d["sana"], d["izoh"], d.get("vaqt"))
         ctx.user_data.pop("pending", None)
-        await q.edit_message_text(f"✅ Saqlandi (#{rid})\n\n" + _kartochka(d) +
-                                  f"\n\n📅 {_dmy(d['sana'])} kuni {REPORT_HOUR}:00 da eslataman.")
+        if d.get("vaqt"):
+            qachon = f"📅 {_dmy(d['sana'])} kuni ⏰ {d['vaqt']} da eslataman."
+        else:
+            qachon = f"📅 {_dmy(d['sana'])} kuni {REPORT_HOUR}:00 da eslataman."
+        await q.edit_message_text(f"✅ Saqlandi (#{rid})\n\n" + _kartochka(d) + "\n\n" + qachon)
 
 
 # ---------------- Kunlik otchot (9:00) ----------------
@@ -342,22 +390,41 @@ async def _otchot_yubor(app):
             log.exception("otchot yuborish (%s)", chat_id)
 
 
-async def otchot_loop(app):
+async def _send_one(app, e):
+    v = (e.get("vaqt") or "").strip()
+    txt = (f"🔔 *Eslatma!*\n\n👤 *{e['ism'] or '—'}* — {e['izoh'] or ''}\n"
+           f"📞 {e['tel'] or '—'}" + (f"  ⏰ {v}" if v else "") + f"  (#{e['id']})")
+    try:
+        await app.bot.send_message(e["chat_id"], txt, parse_mode="Markdown")
+        eslatma_belgila(e["id"])
+    except Exception:
+        log.exception("vaqtli eslatma (%s)", e.get("id"))
+
+
+_last_daily = None
+
+
+async def scheduler_loop(app):
+    global _last_daily
     while True:
         try:
             now = now_tk()
-            target = now.replace(hour=REPORT_HOUR, minute=0, second=0, microsecond=0)
-            if target <= now:
-                target += timedelta(days=1)
-            await asyncio.sleep(max(30, (target - now).total_seconds()))
-            await _otchot_yubor(app)
+            bugun = now.date().isoformat()
+            hhmm = now.strftime("%H:%M")
+            # 1) Vaqtli eslatmalar — aniq belgilangan soatda
+            for e in eslatmalar_vaqtli_due(bugun, hhmm):
+                await _send_one(app, e)
+            # 2) Kunlik otchot (vaqtsizlar) — REPORT_HOUR da kuniga bir marta
+            if now.hour == REPORT_HOUR and _last_daily != bugun:
+                _last_daily = bugun
+                await _otchot_yubor(app)
         except Exception:
-            log.exception("otchot_loop")
-            await asyncio.sleep(300)
+            log.exception("scheduler_loop")
+        await asyncio.sleep(40)
 
 
 async def _post_init(app):
-    asyncio.create_task(otchot_loop(app))
+    asyncio.create_task(scheduler_loop(app))
 
 
 def main():
