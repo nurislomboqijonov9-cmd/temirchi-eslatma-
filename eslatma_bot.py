@@ -1,3 +1,4 @@
+# redeploy
 """
 TEMIRCHI — Follow-up eslatma boti (alohida bot).
 
